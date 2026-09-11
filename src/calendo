@@ -165,6 +165,7 @@ class CalendoApp(Gtk.Application):
         )
         self.window = None
         self.webview = None
+        self.closing = False
         self.state = self._load_state()
 
     # ---------------------------------------------------------------- state
@@ -313,26 +314,35 @@ class CalendoApp(Gtk.Application):
 
     # ---------------------------------------------------------- token bridge
 
-    def _sync_token(self):
-        if self.webview is not None:
-            self.webview.call_async_javascript_function(
-                SESSION_JS, -1, None, None, None, None, self._on_token_read
-            )
+    def _sync_token(self, done=None):
+        if self.webview is None:
+            if done:
+                done()
+            return True
+
+        def finished(webview, result):
+            try:
+                value = webview.call_async_javascript_function_finish(result)
+            except GLib.Error as error:
+                # A logged-out or still-loading page is the normal case here.
+                # Write nothing: a failed read must not wipe a good token.
+                if os.environ.get("CALENDO_DEBUG"):
+                    print(f"calendo: reading session failed: {error.message}")
+                if done:
+                    done()
+                return
+
+            token = None
+            if value is not None and not value.is_null() and not value.is_undefined():
+                token = value.to_string() or None
+            self._write_token(token)
+            if done:
+                done()
+
+        self.webview.call_async_javascript_function(
+            SESSION_JS, -1, None, None, None, None, finished
+        )
         return True  # keep the periodic timer alive
-
-    def _on_token_read(self, webview, result):
-        try:
-            value = webview.call_async_javascript_function_finish(result)
-        except GLib.Error as error:
-            # A logged-out or still-loading page is the normal case here.
-            if os.environ.get("CALENDO_DEBUG"):
-                print(f"calendo: reading session failed: {error.message}")
-            return
-
-        token = None
-        if value is not None and not value.is_null() and not value.is_undefined():
-            token = value.to_string() or None
-        self._write_token(token)
 
     def _write_token(self, token):
         path = os.path.join(user_dir(), "session.json")
@@ -438,9 +448,20 @@ class CalendoApp(Gtk.Application):
             if is_internal(uri):
                 self.webview.load_uri(uri)
 
-    def _on_close(self, *_args):
+    def _on_close(self, window, *_args):
         self._save_state()
-        return False
+        if self.closing:
+            return False
+
+        # calendo-notifier stays silent while we hold the bus name and picks
+        # the schedule up again once we are gone. Hand it the current token
+        # before releasing the name, or it resumes with a stale one — and a
+        # stale token makes the server delete the session.
+        self.closing = True
+        window.hide()  # let the window go at once, the rest is bookkeeping
+        self._sync_token(done=self.quit)
+        GLib.timeout_add_seconds(3, self.quit)  # never hang on a wedged read
+        return True  # hold the close until the token is stored
 
 
 def main():

@@ -33,6 +33,16 @@ TICK_INTERVAL = 30  # look for due reminders twice a minute
 GRACE = 900  # still deliver a reminder missed by up to 15 minutes
 HTTP_TIMEOUT = 20
 DESKTOP_ENTRY = "calendo_calendo"  # snapd names it <snap>_<app>.desktop
+APP_BUS_NAME = "tech.davapps.Calendo"  # the window owns this while it runs
+
+# Codes that mean our token must not be used again until the wrapper hands
+# us a new one. SESSION_EXPIRED needs a renewal only the web app may perform;
+# OLD_ACCESS_TOKEN_USED means the server has already dropped the session.
+TOKEN_DEAD_CODES = (
+    "SESSION_EXPIRED",
+    "OLD_ACCESS_TOKEN_USED",
+    "SESSION_DOES_NOT_EXIST",
+)
 
 
 def user_dir():
@@ -61,6 +71,10 @@ def parse_time(value):
     return int(moment.timestamp())
 
 
+class TokenRejected(Exception):
+    """The server refused our access token; only a new one can help."""
+
+
 def occurrence(entry, now):
     """The most recent moment this reminder should have fired, or None."""
     start = entry["time"]
@@ -78,6 +92,8 @@ class Notifier:
         self.state = self._load_state()  # uuid -> occurrence already delivered
         self.seeded = bool(self.state)
         self.bus = None
+        self.rejected_token = None  # token the server refused, do not retry
+        self.app_was_running = False
 
     # ------------------------------------------------------------- storage
 
@@ -122,8 +138,11 @@ class Notifier:
         with urllib.request.urlopen(request, timeout=HTTP_TIMEOUT) as response:
             payload = json.load(response)
 
-        if payload.get("errors"):
-            raise RuntimeError(payload["errors"][0].get("message", "GraphQL error"))
+        for error in payload.get("errors") or []:
+            code = (error.get("extensions") or {}).get("code")
+            if code in TOKEN_DEAD_CODES:
+                raise TokenRejected(code)
+            raise RuntimeError(error.get("message") or code or "GraphQL error")
 
         listing = (payload.get("data") or {}).get("listNotifications") or {}
         entries = {}
@@ -179,16 +198,60 @@ class Notifier:
 
     # ------------------------------------------------------------- polling
 
+    def _app_is_running(self):
+        """True while the Calendo window holds its bus name.
+
+        This matters more than it looks. The window renews the dav session
+        when it expires, which turns the token we cached into the server's
+        `oldToken` — and a request carrying that makes the API delete the
+        session outright, logging the user out. While the window runs we
+        therefore make no API calls at all. With it closed nothing can renew,
+        so our cached token is either current or simply expired.
+        """
+        try:
+            if self.bus is None:
+                self.bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
+            answer = self.bus.call_sync(
+                "org.freedesktop.DBus",
+                "/org/freedesktop/DBus",
+                "org.freedesktop.DBus",
+                "NameHasOwner",
+                GLib.Variant("(s)", (APP_BUS_NAME,)),
+                GLib.VariantType("(b)"),
+                Gio.DBusCallFlags.NONE,
+                3000,
+                None,
+            )
+            return bool(answer.unpack()[0])
+        except GLib.Error as exc:
+            self.bus = None
+            # Cannot tell — assume it runs. A skipped poll costs nothing, a
+            # request with a stale token costs the user their session.
+            log(f"could not check whether the window runs: {exc.message}")
+            return True
+
     def poll(self):
+        if self._app_is_running():
+            self.app_was_running = True
+            return True
+
         token = self._read_token()
         if not token:
             return True  # not signed in yet — try again next round
+        if token == self.rejected_token:
+            return True  # same dead token, wait for the wrapper to refresh it
 
         try:
             fresh = self._list_notifications(token)
+        except TokenRejected as exc:
+            self.rejected_token = token
+            log(f"server refused the access token ({exc}); waiting for a new one")
+            return True
         except (urllib.error.URLError, OSError, ValueError, RuntimeError) as exc:
             log(f"could not list notifications: {exc}")
             return True
+
+        self.rejected_token = None
 
         now = time.time()
 
@@ -218,6 +281,12 @@ class Notifier:
         return True
 
     def tick(self):
+        # The window just went away: it has written the freshest token on its
+        # way out, so pick the schedule up again without waiting a full poll.
+        if self.app_was_running and not self._app_is_running():
+            self.app_was_running = False
+            self.poll()
+
         now = time.time()
         fired = False
         for uuid, entry in self.entries.items():
@@ -241,22 +310,29 @@ class Notifier:
         GLib.MainLoop().run()
 
 
+# Module level on purpose: the lock lives as long as the open file object
+# does, so dropping the reference would hand the lock straight back.
+_instance_lock = None
+
+
 def claim_single_instance():
     """The wrapper starts us on launch and autostart starts us at login, so
     two attempts to run at once are normal. Whoever gets the lock wins."""
+    global _instance_lock
     handle = open(os.path.join(user_dir(), "notifier.lock"), "w")
     try:
         fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except OSError:
         handle.close()
-        return None
-    return handle  # stays open for the lifetime of the process
+        return False
+    _instance_lock = handle
+    return True
 
 
 if __name__ == "__main__":
     GLib.set_prgname("calendo-notifier")
     os.makedirs(user_dir(), exist_ok=True)
-    if claim_single_instance() is None:
+    if not claim_single_instance():
         log("another instance already holds the lock, exiting")
         sys.exit(0)
     Notifier().run()

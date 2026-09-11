@@ -114,7 +114,25 @@ the reminders itself:
 Notifications the page raises while the window is open still go through the
 `show-notification` signal as before.
 
-Two behaviours worth knowing:
+### Why the daemon goes quiet while the window is open
+
+A dav session expires after a day and is renewed by the web app. Renewal
+rotates the token: the old one becomes the server's `oldToken`, and a request
+carrying that makes the API **delete the session** — the user is signed out.
+
+The daemon therefore makes no API call while `tech.davapps.Calendo` is owned
+on the session bus, which is exactly as long as the window runs. With the
+window closed nothing can renew, so the cached token is either current or
+plainly expired, never "old". On the way out the window writes the freshest
+token before it releases the bus name, and the daemon resumes within 30
+seconds of the name disappearing. A token the server does refuse is recorded
+and never retried until the wrapper supplies a different one.
+
+Not solved by this: with the window closed for more than a day the session
+expires and nobody renews it, so reminders stop until Calendo is opened
+again. Fixing that needs the bridge to work in both directions.
+
+Two more behaviours worth knowing:
 
 - The server deletes a one-shot notification the moment it sends its own web
   push. The daemon keeps an entry that vanished from the list if it still
