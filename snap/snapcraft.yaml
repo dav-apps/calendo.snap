@@ -1,0 +1,73 @@
+name: calendo
+title: Calendo
+version: '1.0.0'
+summary: Appointments, todos and timely reminders in one app
+description: |
+  Calendo is your all-in-one app for appointments, todos, and timely
+  reminders.
+
+  This package is a thin native window around the Calendo web app. The
+  rendering engine comes from the GNOME platform snap that Ubuntu desktops
+  already ship, so the download stays a few dozen kilobytes and no extra
+  browser is installed alongside it.
+
+  Data is stored and synchronised through a dav account.
+
+license: MIT
+website: https://calendo.dav-apps.tech
+contact: https://github.com/dav-apps/Calendo/issues
+issues: https://github.com/dav-apps/Calendo/issues
+source-code: https://github.com/dav-apps/Calendo
+
+base: core24
+grade: stable
+confinement: strict
+
+platforms:
+  amd64:
+  # arm64 can be added via `snapcraft remote-build`; the part contains no
+  # compiled binaries, so it is architecture neutral.
+
+slots:
+  # Without this the session bus refuses the GApplication id under AppArmor
+  # and g_application_register() fails, which aborts the whole run.
+  dbus-calendo:
+    interface: dbus
+    bus: session
+    name: tech.davapps.Calendo
+
+apps:
+  calendo:
+    command: bin/calendo
+    extensions: [gnome]
+    common-id: tech.davapps.Calendo
+    plugs:
+      - network
+      - audio-playback
+    slots:
+      - dbus-calendo
+    environment:
+      # The gnome extension sets GTK_USE_PORTAL=1, which makes GLib pick the
+      # portal proxy resolver — and snapd's portal denies that call, costing
+      # a failed first page load. Pin the resolver the platform snap ships.
+      GIO_USE_PROXY_RESOLVER: libproxy
+
+  notifier:
+    command: bin/calendo-notifier
+    extensions: [gnome]
+    autostart: calendo-notifier.desktop
+    plugs:
+      - network
+
+parts:
+  calendo:
+    plugin: dump
+    source: src
+    organize:
+      calendo: bin/calendo
+      calendo-notifier: bin/calendo-notifier
+    override-build: |
+      craftctl default
+      rm -rf "${CRAFT_PART_INSTALL}/__pycache__"
+      chmod 0755 "${CRAFT_PART_INSTALL}/calendo" \
+                 "${CRAFT_PART_INSTALL}/calendo-notifier"

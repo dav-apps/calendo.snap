@@ -1,0 +1,262 @@
+#!/usr/bin/env python3
+"""calendo-notifier — delivers Calendo reminders on the desktop.
+
+WebKitGTK ships no Push API, so the wrapper cannot receive web push. It does
+not need to: a dav notification is a scheduled object (time, interval, title,
+body) that the API hands out on request. This daemon keeps that list in sync
+and fires the reminders itself through the desktop notification service.
+
+The access token comes from the wrapper, which reads it out of its own
+WebView and drops it in SNAP_USER_COMMON. Without a token this process just
+idles — that is the normal state before the user has signed in.
+"""
+
+import fcntl
+import json
+import os
+import sys
+import time
+import urllib.error
+import urllib.request
+from datetime import datetime, timezone
+
+from gi.repository import Gio, GLib
+
+API_URL = "https://dav-api-ax6gp.ondigitalocean.app"
+QUERY = (
+    "query ListNotifications { listNotifications { items "
+    "{ uuid time interval title body } } }"
+)
+
+POLL_INTERVAL = 900  # refresh the list every 15 minutes
+TICK_INTERVAL = 30  # look for due reminders twice a minute
+GRACE = 900  # still deliver a reminder missed by up to 15 minutes
+HTTP_TIMEOUT = 20
+DESKTOP_ENTRY = "calendo_calendo"  # snapd names it <snap>_<app>.desktop
+
+
+def user_dir():
+    return os.environ.get("SNAP_USER_COMMON") or os.path.join(
+        GLib.get_user_data_dir(), "calendo"
+    )
+
+
+def log(message):
+    print(f"calendo-notifier: {message}", flush=True)
+
+
+def parse_time(value):
+    """The API returns an ISO 8601 string; dav-js parses it the same way."""
+    if not value:
+        return None
+    text = str(value).strip()
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    try:
+        moment = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if moment.tzinfo is None:
+        moment = moment.replace(tzinfo=timezone.utc)
+    return int(moment.timestamp())
+
+
+def occurrence(entry, now):
+    """The most recent moment this reminder should have fired, or None."""
+    start = entry["time"]
+    if now < start:
+        return None
+    interval = entry["interval"]
+    if interval <= 0:
+        return start
+    return start + ((int(now) - start) // interval) * interval
+
+
+class Notifier:
+    def __init__(self):
+        self.entries = {}  # uuid -> entry
+        self.state = self._load_state()  # uuid -> occurrence already delivered
+        self.seeded = bool(self.state)
+        self.bus = None
+
+    # ------------------------------------------------------------- storage
+
+    def _state_path(self):
+        return os.path.join(user_dir(), "notifier-state.json")
+
+    def _load_state(self):
+        try:
+            with open(self._state_path(), encoding="utf-8") as fh:
+                data = json.load(fh)
+            return {str(k): int(v) for k, v in data.items()}
+        except (OSError, ValueError, TypeError):
+            return {}
+
+    def _save_state(self):
+        try:
+            path = self._state_path()
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "w", encoding="utf-8") as fh:
+                json.dump(self.state, fh)
+        except OSError as exc:
+            log(f"could not save state: {exc}")
+
+    def _read_token(self):
+        try:
+            with open(os.path.join(user_dir(), "session.json"), encoding="utf-8") as fh:
+                return (json.load(fh) or {}).get("accessToken") or None
+        except (OSError, ValueError):
+            return None
+
+    # ----------------------------------------------------------------- api
+
+    def _list_notifications(self, token):
+        request = urllib.request.Request(
+            API_URL,
+            data=json.dumps({"query": QUERY}).encode("utf-8"),
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": token,
+            },
+        )
+        with urllib.request.urlopen(request, timeout=HTTP_TIMEOUT) as response:
+            payload = json.load(response)
+
+        if payload.get("errors"):
+            raise RuntimeError(payload["errors"][0].get("message", "GraphQL error"))
+
+        listing = (payload.get("data") or {}).get("listNotifications") or {}
+        entries = {}
+        for item in listing.get("items") or []:
+            moment = parse_time(item.get("time"))
+            uuid = item.get("uuid")
+            if moment is None or not uuid:
+                continue
+            entries[uuid] = {
+                "uuid": uuid,
+                "time": moment,
+                "interval": int(item.get("interval") or 0),
+                "title": item.get("title") or "Calendo",
+                "body": item.get("body") or "",
+            }
+        return entries
+
+    # -------------------------------------------------------- notification
+
+    def _notify(self, title, body):
+        try:
+            if self.bus is None:
+                self.bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
+            self.bus.call_sync(
+                "org.freedesktop.Notifications",
+                "/org/freedesktop/Notifications",
+                "org.freedesktop.Notifications",
+                "Notify",
+                GLib.Variant(
+                    "(susssasa{sv}i)",
+                    (
+                        "Calendo",
+                        0,
+                        "",
+                        title,
+                        body,
+                        [],
+                        {
+                            "desktop-entry": GLib.Variant("s", DESKTOP_ENTRY),
+                            "urgency": GLib.Variant("y", 1),
+                        },
+                        -1,
+                    ),
+                ),
+                GLib.VariantType("(u)"),
+                Gio.DBusCallFlags.NONE,
+                5000,
+                None,
+            )
+        except GLib.Error as exc:
+            self.bus = None
+            log(f"notification failed: {exc.message}")
+
+    # ------------------------------------------------------------- polling
+
+    def poll(self):
+        token = self._read_token()
+        if not token:
+            return True  # not signed in yet — try again next round
+
+        try:
+            fresh = self._list_notifications(token)
+        except (urllib.error.URLError, OSError, ValueError, RuntimeError) as exc:
+            log(f"could not list notifications: {exc}")
+            return True
+
+        now = time.time()
+
+        # The server deletes a one-shot notification the moment it sends its
+        # own web push. Keep anything it dropped that we still owe the user,
+        # otherwise that race would swallow the reminder entirely.
+        for uuid, entry in self.entries.items():
+            if uuid in fresh:
+                continue
+            due = occurrence(entry, now)
+            if due is not None and now - due <= GRACE and self.state.get(uuid) != due:
+                fresh[uuid] = entry
+
+        self.entries = fresh
+        self.state = {k: v for k, v in self.state.items() if k in self.entries}
+
+        if not self.seeded:
+            # First ever run: treat everything already due as delivered, so a
+            # fresh install does not replay a backlog of old reminders.
+            for uuid, entry in self.entries.items():
+                due = occurrence(entry, now)
+                if due is not None:
+                    self.state[uuid] = due
+            self.seeded = True
+            self._save_state()
+
+        return True
+
+    def tick(self):
+        now = time.time()
+        fired = False
+        for uuid, entry in self.entries.items():
+            due = occurrence(entry, now)
+            if due is None or now - due > GRACE:
+                continue
+            if self.state.get(uuid) == due:
+                continue
+            self._notify(entry["title"], entry["body"])
+            self.state[uuid] = due
+            fired = True
+        if fired:
+            self._save_state()
+        return True
+
+    def run(self):
+        self.poll()
+        self.tick()
+        GLib.timeout_add_seconds(POLL_INTERVAL, self.poll)
+        GLib.timeout_add_seconds(TICK_INTERVAL, self.tick)
+        GLib.MainLoop().run()
+
+
+def claim_single_instance():
+    """The wrapper starts us on launch and autostart starts us at login, so
+    two attempts to run at once are normal. Whoever gets the lock wins."""
+    handle = open(os.path.join(user_dir(), "notifier.lock"), "w")
+    try:
+        fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        handle.close()
+        return None
+    return handle  # stays open for the lifetime of the process
+
+
+if __name__ == "__main__":
+    GLib.set_prgname("calendo-notifier")
+    os.makedirs(user_dir(), exist_ok=True)
+    if claim_single_instance() is None:
+        log("another instance already holds the lock, exiting")
+        sys.exit(0)
+    Notifier().run()

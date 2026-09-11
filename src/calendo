@@ -1,0 +1,453 @@
+#!/usr/bin/env python3
+"""Calendo — a thin native window around the Calendo PWA.
+
+The web engine comes from the gnome-46-2404 platform snap (WebKitGTK 4.1),
+so this package stays a few kilobytes. Browsing data lives in
+$SNAP_USER_COMMON and therefore survives snap refreshes.
+"""
+
+import json
+import os
+import sys
+
+import gi
+
+gi.require_version("Gtk", "3.0")
+gi.require_version("Gdk", "3.0")
+gi.require_version("WebKit2", "4.1")
+
+from gi.repository import Gdk, Gio, GLib, Gtk, WebKit2  # noqa: E402
+
+APP_ID = "tech.davapps.Calendo"
+APP_NAME = "Calendo"
+HOME_URL = "https://calendo.dav-apps.tech/"
+
+# Hosts that stay inside the app window. The dav account login lives on
+# dav-apps.tech, so it has to be in here or signing in would bounce out
+# into the browser.
+INTERNAL_HOSTS = (
+    "calendo.dav-apps.tech",
+    "dav-apps.tech",
+    "www.dav-apps.tech",
+)
+
+UA_SUFFIX = "CalendoSnap/1.0"
+DEFAULT_SIZE = (1100, 760)
+MIN_SIZE = (360, 480)
+ZOOM_STEPS = (0.5, 0.67, 0.8, 0.9, 1.0, 1.1, 1.25, 1.5, 1.75, 2.0)
+SESSION_POLL_SECONDS = 300
+
+# dav-js keeps the session in localforage, which defaults to an IndexedDB
+# database "localforage" with a "keyvaluepairs" store. We hand the access
+# token to calendo-notifier, which cannot reach the WebView's storage itself.
+SESSION_JS = """
+const request = indexedDB.open("localforage");
+const db = await new Promise((resolve, reject) => {
+  request.onsuccess = () => resolve(request.result);
+  request.onerror = () => reject(request.error);
+});
+if (!db.objectStoreNames.contains("keyvaluepairs")) return null;
+const store = db
+  .transaction("keyvaluepairs", "readonly")
+  .objectStore("keyvaluepairs");
+const session = await new Promise((resolve, reject) => {
+  const get = store.get("session");
+  get.onsuccess = () => resolve(get.result || null);
+  get.onerror = () => reject(get.error);
+});
+return session && session.AccessToken ? session.AccessToken : null;
+"""
+
+
+def user_dir(*parts):
+    """Persistent per-user directory, shared across snap revisions."""
+    base = os.environ.get("SNAP_USER_COMMON") or os.path.join(
+        GLib.get_user_data_dir(), "calendo"
+    )
+    path = os.path.join(base, *parts)
+    os.makedirs(path, exist_ok=True)
+    return path
+
+
+AUTOSTART_FILE = "calendo-notifier.desktop"
+
+
+def ensure_autostart():
+    """Put the reminder daemon's desktop file where snapd will find it.
+
+    snapd does not create this: the `autostart:` key in snapcraft.yaml only
+    ties a desktop file to an app. At login `snap userd --autostart` launches
+    whatever sits in $SNAP_USER_DATA/.config/autostart, so the file has to be
+    copied there by us.
+    """
+    snap = os.environ.get("SNAP")
+    user_data = os.environ.get("SNAP_USER_DATA")
+    if not snap or not user_data:
+        return
+
+    source = os.path.join(snap, "meta", "gui", AUTOSTART_FILE)
+    target = os.path.join(user_data, ".config", "autostart", AUTOSTART_FILE)
+    try:
+        with open(source, encoding="utf-8") as fh:
+            wanted = fh.read()
+        try:
+            with open(target, encoding="utf-8") as fh:
+                if fh.read() == wanted:
+                    return
+        except OSError:
+            pass
+        os.makedirs(os.path.dirname(target), exist_ok=True)
+        with open(target, "w", encoding="utf-8") as fh:
+            fh.write(wanted)
+    except OSError as error:
+        print(f"calendo: could not install autostart entry: {error}")
+
+
+def start_notifier():
+    """Launch the reminder daemon now, so reminders work before the next
+    login too. The daemon holds a lock and exits at once if one is running."""
+    snap = os.environ.get("SNAP")
+    if not snap:
+        return
+    binary = os.path.join(snap, "bin", "calendo-notifier")
+    if not os.path.exists(binary):
+        return
+    try:
+        Gio.Subprocess.new(
+            [binary],
+            Gio.SubprocessFlags.STDOUT_SILENCE | Gio.SubprocessFlags.STDERR_SILENCE,
+        )
+    except GLib.Error as error:
+        print(f"calendo: could not start the reminder daemon: {error.message}")
+
+
+def is_internal(uri):
+    if not uri:
+        return False
+    try:
+        host = GLib.Uri.parse(uri, GLib.UriFlags.NONE).get_host() or ""
+    except GLib.Error:
+        return False
+    return host.lower() in INTERNAL_HOSTS
+
+
+OFFLINE_PAGE = """
+<!doctype html><meta charset="utf-8">
+<style>
+  :root { color-scheme: light dark; }
+  body { margin:0; height:100vh; display:flex; align-items:center;
+         justify-content:center; font-family:system-ui,sans-serif;
+         background:#fafafa; color:#2a2a2a; }
+  @media (prefers-color-scheme: dark) {
+    body { background:#1c1c1c; color:#e8e8e8; }
+  }
+  .box { text-align:center; max-width:26rem; padding:2rem; }
+  h1 { font-size:1.25rem; margin:0 0 .5rem; }
+  p { margin:0 0 1.5rem; opacity:.7; line-height:1.5; }
+  button { font:inherit; padding:.5rem 1.25rem; border-radius:.5rem;
+           border:1px solid currentColor; background:none; color:inherit;
+           cursor:pointer; }
+</style>
+<div class="box">
+  <h1>Calendo ist nicht erreichbar</h1>
+  <p>Keine Verbindung zu %(host)s. Prüfe deine Internetverbindung
+     und versuche es erneut.</p>
+  <button onclick="location.reload()">Erneut versuchen</button>
+</div>
+"""
+
+
+class CalendoApp(Gtk.Application):
+    def __init__(self):
+        super().__init__(
+            application_id=APP_ID,
+            flags=Gio.ApplicationFlags.HANDLES_OPEN,
+        )
+        self.window = None
+        self.webview = None
+        self.state = self._load_state()
+
+    # ---------------------------------------------------------------- state
+
+    def _state_path(self):
+        return os.path.join(user_dir(), "window.json")
+
+    def _load_state(self):
+        try:
+            with open(self._state_path(), encoding="utf-8") as fh:
+                return json.load(fh)
+        except (OSError, ValueError):
+            return {}
+
+    def _save_state(self):
+        if not self.window:
+            return
+        width, height = self.window.get_size()
+        self.state.update(
+            {
+                "width": width,
+                "height": height,
+                "maximized": self.window.is_maximized(),
+                "zoom": round(self.webview.get_zoom_level(), 3),
+            }
+        )
+        try:
+            with open(self._state_path(), "w", encoding="utf-8") as fh:
+                json.dump(self.state, fh)
+        except OSError:
+            pass
+
+    # ------------------------------------------------------------ web setup
+
+    def _build_webview(self):
+        # A WebsiteDataManager anchored in SNAP_USER_COMMON is what makes
+        # localStorage, IndexedDB and service workers persist.
+        manager = WebKit2.WebsiteDataManager(
+            base_data_directory=user_dir("profile", "data"),
+            base_cache_directory=user_dir("profile", "cache"),
+        )
+        context = WebKit2.WebContext.new_with_website_data_manager(manager)
+        context.set_cache_model(WebKit2.CacheModel.WEB_BROWSER)
+
+        cookies = manager.get_cookie_manager()
+        cookies.set_accept_policy(WebKit2.CookieAcceptPolicy.ALWAYS)
+        cookies.set_persistent_storage(
+            os.path.join(user_dir("profile", "data"), "cookies.sqlite"),
+            WebKit2.CookiePersistentStorage.SQLITE,
+        )
+
+        # Pre-grant notifications so the page does not have to ask on a
+        # surface where the user cannot see a permission bar.
+        origin = WebKit2.SecurityOrigin.new_for_uri(HOME_URL)
+        context.initialize_notification_permissions([origin], [])
+
+        webview = WebKit2.WebView(web_context=context)
+
+        settings = webview.get_settings()
+        settings.set_user_agent_with_application_details("Calendo", "1.0")
+        settings.set_property("user-agent", f"{settings.get_user_agent()} {UA_SUFFIX}")
+        for prop, value in (
+            ("enable-developer-extras", bool(os.environ.get("CALENDO_DEBUG"))),
+            ("enable-smooth-scrolling", True),
+            ("enable-back-forward-navigation-gestures", True),
+            ("media-playback-requires-user-gesture", False),
+            ("enable-media-stream", False),
+        ):
+            try:
+                settings.set_property(prop, value)
+            except TypeError:
+                pass  # property gone in this WebKit build — not worth failing over
+
+        webview.connect("decide-policy", self._on_decide_policy)
+        webview.connect("permission-request", self._on_permission_request)
+        webview.connect("show-notification", self._on_show_notification)
+        webview.connect("load-failed", self._on_load_failed)
+        webview.connect("load-changed", self._on_load_changed)
+        webview.connect("button-press-event", self._on_button_press)
+
+        zoom = self.state.get("zoom")
+        if isinstance(zoom, (int, float)) and 0.2 <= zoom <= 4:
+            webview.set_zoom_level(zoom)
+
+        return webview
+
+    # -------------------------------------------------------------- signals
+
+    def _on_decide_policy(self, webview, decision, decision_type):
+        types = WebKit2.PolicyDecisionType
+        if decision_type == types.NAVIGATION_ACTION:
+            action = decision.get_navigation_action()
+            uri = action.get_request().get_uri()
+            # Only hand off what the user actually clicked; redirects during
+            # login must stay in the window.
+            if (
+                action.get_navigation_type() == WebKit2.NavigationType.LINK_CLICKED
+                and not is_internal(uri)
+            ):
+                decision.ignore()
+                self._open_external(uri)
+                return True
+        elif decision_type == types.NEW_WINDOW_ACTION:
+            uri = decision.get_navigation_action().get_request().get_uri()
+            decision.ignore()
+            if is_internal(uri):
+                webview.load_uri(uri)
+            else:
+                self._open_external(uri)
+            return True
+        return False
+
+    def _on_permission_request(self, webview, request):
+        if isinstance(request, WebKit2.NotificationPermissionRequest):
+            request.allow()
+            return True
+        request.deny()
+        return True
+
+    def _on_show_notification(self, webview, notification):
+        note = Gio.Notification.new(notification.get_title() or APP_NAME)
+        if notification.get_body():
+            note.set_body(notification.get_body())
+        note.set_default_action("app.present")
+        tag = notification.get_tag() or f"calendo-{notification.get_id()}"
+        self.send_notification(tag, note)
+        notification.connect("closed", lambda _n: self.withdraw_notification(tag))
+        return True  # handled — do not fall back to WebKit's own bubble
+
+    def _on_load_failed(self, webview, event, failing_uri, error):
+        # Only genuine network failures get the offline page. Anything else —
+        # a cancelled load, or a sandbox/portal hiccup that WebKit retries on
+        # its own — must fall through, or we would replace a page that is
+        # about to load fine.
+        if error.domain != "WebKitNetworkError":
+            return False
+        if error.code == WebKit2.NetworkError.CANCELLED:
+            return False
+        host = GLib.Uri.parse(HOME_URL, GLib.UriFlags.NONE).get_host()
+        webview.load_alternate_html(OFFLINE_PAGE % {"host": host}, failing_uri, None)
+        return True
+
+    def _on_load_changed(self, webview, event):
+        if event == WebKit2.LoadEvent.FINISHED:
+            self._sync_token()
+
+    # ---------------------------------------------------------- token bridge
+
+    def _sync_token(self):
+        if self.webview is not None:
+            self.webview.call_async_javascript_function(
+                SESSION_JS, -1, None, None, None, None, self._on_token_read
+            )
+        return True  # keep the periodic timer alive
+
+    def _on_token_read(self, webview, result):
+        try:
+            value = webview.call_async_javascript_function_finish(result)
+        except GLib.Error as error:
+            # A logged-out or still-loading page is the normal case here.
+            if os.environ.get("CALENDO_DEBUG"):
+                print(f"calendo: reading session failed: {error.message}")
+            return
+
+        token = None
+        if value is not None and not value.is_null() and not value.is_undefined():
+            token = value.to_string() or None
+        self._write_token(token)
+
+    def _write_token(self, token):
+        path = os.path.join(user_dir(), "session.json")
+        payload = {"accessToken": token} if token else {}
+        try:
+            with open(path, encoding="utf-8") as fh:
+                if json.load(fh) == payload:
+                    return  # unchanged, leave the file and its mtime alone
+        except (OSError, ValueError):
+            pass
+
+        temporary = f"{path}.tmp"
+        try:
+            handle = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(handle, "w", encoding="utf-8") as fh:
+                json.dump(payload, fh)
+            os.replace(temporary, path)
+        except OSError as error:
+            if os.environ.get("CALENDO_DEBUG"):
+                print(f"calendo: could not store session: {error}")
+
+    def _on_button_press(self, webview, event):
+        if event.button == 8:
+            webview.go_back()
+            return True
+        if event.button == 9:
+            webview.go_forward()
+            return True
+        return False
+
+    def _open_external(self, uri):
+        # Routed through the portal / xdg-open, so it lands in the user's
+        # default browser with their own session.
+        Gtk.show_uri_on_window(self.window, uri, Gdk.CURRENT_TIME)
+
+    # -------------------------------------------------------------- actions
+
+    def _add_actions(self):
+        def add(name, callback, *accels):
+            action = Gio.SimpleAction.new(name, None)
+            action.connect("activate", callback)
+            self.add_action(action)
+            if accels:
+                self.set_accels_for_action(f"app.{name}", list(accels))
+
+        add("present", lambda *_: self.window.present())
+        add("reload", lambda *_: self.webview.reload(), "F5", "<Ctrl>r")
+        add("back", lambda *_: self.webview.go_back(), "<Alt>Left")
+        add("forward", lambda *_: self.webview.go_forward(), "<Alt>Right")
+        add("home", lambda *_: self.webview.load_uri(HOME_URL), "<Alt>Home")
+        add("quit", lambda *_: self.quit(), "<Ctrl>q")
+        add("zoom-in", lambda *_: self._zoom(1), "<Ctrl>plus", "<Ctrl>equal")
+        add("zoom-out", lambda *_: self._zoom(-1), "<Ctrl>minus")
+        add("zoom-reset", lambda *_: self.webview.set_zoom_level(1.0), "<Ctrl>0")
+
+    def _zoom(self, direction):
+        current = self.webview.get_zoom_level()
+        candidates = ZOOM_STEPS if direction > 0 else reversed(ZOOM_STEPS)
+        for step in candidates:
+            if (direction > 0 and step > current + 0.01) or (
+                direction < 0 and step < current - 0.01
+            ):
+                self.webview.set_zoom_level(step)
+                return
+
+    # ----------------------------------------------------------- lifecycle
+
+    def do_startup(self):
+        Gtk.Application.do_startup(self)
+        self._add_actions()
+        ensure_autostart()
+        start_notifier()
+
+    def do_activate(self):
+        if self.window:
+            self.window.present()
+            return
+
+        self.webview = self._build_webview()
+
+        self.window = Gtk.ApplicationWindow(application=self)
+        self.window.set_title(APP_NAME)
+        self.window.set_size_request(*MIN_SIZE)
+        self.window.set_default_size(
+            self.state.get("width", DEFAULT_SIZE[0]),
+            self.state.get("height", DEFAULT_SIZE[1]),
+        )
+        if self.state.get("maximized"):
+            self.window.maximize()
+        self.window.add(self.webview)
+        self.window.connect("delete-event", self._on_close)
+
+        self.webview.load_uri(HOME_URL)
+        self.window.show_all()
+
+        # The token can change without a page load (sign in, sign out, renewal).
+        GLib.timeout_add_seconds(SESSION_POLL_SECONDS, self._sync_token)
+
+    def do_open(self, files, n_files, hint):
+        self.activate()
+        for gfile in files[:1]:
+            uri = gfile.get_uri()
+            if is_internal(uri):
+                self.webview.load_uri(uri)
+
+    def _on_close(self, *_args):
+        self._save_state()
+        return False
+
+
+def main():
+    GLib.set_prgname("calendo")
+    GLib.set_application_name(APP_NAME)
+    return CalendoApp().run(sys.argv)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

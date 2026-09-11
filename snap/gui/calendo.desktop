@@ -1,0 +1,15 @@
+[Desktop Entry]
+Type=Application
+Name=Calendo
+GenericName=Calendar
+GenericName[de]=Kalender
+Comment=Appointments, todos and timely reminders in one app
+Comment[de]=Termine, Aufgaben und Erinnerungen in einer App
+Exec=calendo %u
+Icon=${SNAP}/meta/gui/calendo.png
+Terminal=false
+Categories=Office;Calendar;ProjectManagement;
+Keywords=calendar;appointments;tasks;todo;reminders;
+Keywords[de]=Kalender;Termine;Aufgaben;Erinnerungen;
+StartupNotify=true
+StartupWMClass=calendo

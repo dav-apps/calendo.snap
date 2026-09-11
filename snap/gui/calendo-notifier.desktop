@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Calendo Reminders
+Name[de]=Calendo-Erinnerungen
+Comment=Delivers Calendo reminders in the background
+Comment[de]=Stellt Calendo-Erinnerungen im Hintergrund zu
+Exec=calendo.notifier
+Icon=${SNAP}/meta/gui/calendo.png
+Terminal=false
+NoDisplay=true
+X-GNOME-Autostart-enabled=true
